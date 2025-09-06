@@ -20,6 +20,7 @@ pub struct Sender<T> {
 
 pub struct Receiver<T> {
     shared: Arc<Shared<T>>,
+    cache: VecDeque<T>,
 }
 
 impl<T> Sender<T> {
@@ -54,10 +55,21 @@ impl<T> Sender<T> {
 
 impl<T> Receiver<T> {
     pub fn recv(&mut self) -> Result<T> {
+        // no lock fast path
+        if let Some(v) = self.cache.pop_front() {
+            return Ok(v);
+        }
+
+        // get lock of queue
         let mut inner = self.shared.queue.lock().unwrap();
         loop {
             match inner.pop_front() {
+                // get data and return
                 Some(t) => {
+                    if !inner.is_empty() {
+                        std::mem::swap(&mut self.cache, &mut *inner);
+                    }
+
                     return Ok(t);
                 }
                 None if self.shared.senders.load(Ordering::SeqCst) == 0 => {
@@ -129,7 +141,10 @@ pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
         Sender {
             shared: shared.clone(),
         },
-        Receiver { shared },
+        Receiver {
+            shared,
+            cache: VecDeque::with_capacity(INITIAL_SIZE),
+        },
     )
 }
 
@@ -174,7 +189,7 @@ mod tests {
     #[test]
     fn receiver_should_be_blocked_when_nothing_to_read() {
         let (mut s, r) = unbounded();
-        let mut s1 = s.clone();
+        let s1 = s.clone();
 
         thread::spawn(move || {
             for (idx, i) in r.into_iter().enumerate() {
@@ -249,5 +264,25 @@ mod tests {
         });
 
         t1.join().unwrap();
+    }
+
+    #[test]
+    fn channel_fast_path_should_work() {
+        let (mut s, mut r) = unbounded();
+        for i in 0..10usize {
+            s.send(i).unwrap();
+        }
+
+        assert!(r.cache.is_empty());
+
+        assert_eq!(0, r.recv().unwrap());
+
+        assert_eq!(r.cache.len(), 9);
+
+        assert_eq!(s.total_queued_items(), 0);
+
+        for (idx, i) in r.into_iter().take(9).enumerate() {
+            assert_eq!(idx + 1, i);
+        }
     }
 }
